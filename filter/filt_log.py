@@ -41,6 +41,70 @@ def format_percent(count, total):
     return f'{(100.0 * count / total):.2f}%'
 
 
+def _first_true_run(mask, min_run):
+    run = 0
+    for i, value in enumerate(mask):
+        if value:
+            run += 1
+            if run >= min_run:
+                return i - min_run + 1
+        else:
+            run = 0
+    return None
+
+
+def find_analysis_window(df, timestamp_col, speed_col):
+    speed = pd.to_numeric(df[speed_col], errors='coerce')
+
+    smooth_speed = (
+        pd.DataFrame({'t': df[timestamp_col], 's': speed})
+        .set_index('t')['s']
+        .rolling('3s', min_periods=1)
+        .mean()
+        .to_numpy()
+    )
+
+    # Use hysteresis and a minimum run length to reduce false start/stop triggers.
+    start_threshold = 10.0
+    stop_threshold = 8.0
+    min_run = 3
+
+    moving = smooth_speed > start_threshold
+
+    if not np.any(moving):
+        return 0, len(df) - 1
+
+    first_moving_pos = _first_true_run(moving, min_run)
+    if first_moving_pos is None:
+        return 0, len(df) - 1
+
+    moving_positions = np.flatnonzero(moving)
+    last_moving_pos = int(moving_positions[-1])
+
+    first_moving_idx = int(df.index[first_moving_pos])
+    last_moving_idx = int(df.index[last_moving_pos])
+
+    start_trigger_time = df.loc[first_moving_idx, timestamp_col]
+    start_time = start_trigger_time - pd.Timedelta(seconds=3)
+
+    remaining = smooth_speed[last_moving_pos + 1 :]
+    stop_run_pos = _first_true_run(remaining < stop_threshold, min_run)
+    if stop_run_pos is not None:
+        below_pos = last_moving_pos + 1 + stop_run_pos
+        end_trigger_time = df.iloc[below_pos][timestamp_col]
+    else:
+        end_trigger_time = df.loc[last_moving_idx, timestamp_col]
+
+    end_time = end_trigger_time + pd.Timedelta(seconds=3)
+
+    start_candidates = df.index[df[timestamp_col] >= start_time]
+    end_candidates = df.index[df[timestamp_col] <= end_time]
+
+    start_idx = start_candidates[0] if len(start_candidates) > 0 else 0
+    end_idx = end_candidates[-1] if len(end_candidates) > 0 else len(df) - 1
+    return int(start_idx), int(end_idx)
+
+
 def clean_and_smooth_gps(df, change_log):
     """Validate, repair, and smooth GPS coordinates in-place."""
     if 'GPS' not in df.columns:
@@ -125,7 +189,7 @@ def clean_and_smooth_gps(df, change_log):
         repaired_value = f'{lat_smooth.loc[idx]:.6f} {lon_smooth.loc[idx]:.6f}'
         change_log.append(
             {
-                'Row_Number': int(idx) + 1,
+                'Row_Number': int(df.at[idx, '_source_row']) + 1 if '_source_row' in df.columns else int(idx) + 1,
                 'Column': 'GPS',
                 'Original_Value': df.at[idx, 'GPS'],
                 'Replacement_Value': f'{repaired_value} [reason={"|".join(reasons)}]',
@@ -193,19 +257,51 @@ details_path = output_path.with_name(f'{output_path.stem}_repair_details{output_
 # Load your file
 df = pd.read_csv(original_path)
 
+original_total_rows = len(df)
+trim_start_count = 0
+trim_end_count = 0
+
+df['_source_row'] = np.arange(len(df), dtype=int)
+timestamps = parse_timestamps(df)
+
+if 'GSpd(kmh)' in df.columns and timestamps.notna().any():
+    timed_df = df[timestamps.notna()].copy()
+    timed_df['_timestamp'] = timestamps[timestamps.notna()]
+    timed_df = timed_df.sort_values('_timestamp').reset_index(drop=True)
+
+    start_idx, end_idx = find_analysis_window(timed_df, '_timestamp', 'GSpd(kmh)')
+    trim_start_count = int(start_idx)
+    trim_end_count = int(len(timed_df) - 1 - end_idx)
+    df = timed_df.loc[start_idx:end_idx].copy()
+else:
+    df['_timestamp'] = timestamps
+
+change_log = [
+    {
+        'Row_Number': np.nan,
+        'Column': 'TRIM_START_ROWS_REMOVED',
+        'Original_Value': trim_start_count,
+        'Replacement_Value': format_percent(trim_start_count, original_total_rows),
+    },
+    {
+        'Row_Number': np.nan,
+        'Column': 'TRIM_END_ROWS_REMOVED',
+        'Original_Value': trim_end_count,
+        'Replacement_Value': format_percent(trim_end_count, original_total_rows),
+    },
+]
+
 # --- CONFIGURATION ---
 window_size = 10 
 threshold = 3 
 
 # Select numeric columns
-numeric_cols = df.select_dtypes(include=[np.number]).columns
+exclude_numeric = {'_source_row'}
+numeric_cols = [col for col in df.select_dtypes(include=[np.number]).columns if col not in exclude_numeric]
 
 # Rolling medians can produce decimal values, so convert numeric columns to float
 # before writing repaired values back into the dataframe.
 df[numeric_cols] = df[numeric_cols].astype(float)
-
-# List to store change details
-change_log = []
 
 for col in numeric_cols:
     # Calculate rolling median and standard deviation
@@ -220,7 +316,7 @@ for col in numeric_cols:
     
     for idx in outlier_indices:
         change_log.append({
-            'Row_Number': idx + 1,  # Adding 1 for human-readable row count
+            'Row_Number': int(df.at[idx, '_source_row']) + 1,
             'Column': col,
             'Original_Value': df.at[idx, col],
             'Replacement_Value': rolling_median[idx]
@@ -234,6 +330,11 @@ gps_stats = clean_and_smooth_gps(df, change_log)
 # Final cleanup for edge cases
 df = df.ffill().bfill()
 
+if '_source_row' in df.columns:
+    df = df.drop(columns=['_source_row'])
+if '_timestamp' in df.columns:
+    df = df.drop(columns=['_timestamp'])
+
 # Save the repaired data
 df.to_csv(output_path, index=False)
 
@@ -245,6 +346,9 @@ if change_log:
     print(f"Original file: {original_path.name}")
     print(f"Repaired file: {output_path.name}")
     print(f"Change log: {details_path.name}")
+    print('Trim summary:')
+    print(f"  start removed: {trim_start_count} ({format_percent(trim_start_count, original_total_rows)})")
+    print(f"  end removed: {trim_end_count} ({format_percent(trim_end_count, original_total_rows)})")
     print('GPS warnings:')
     print(
         f"  invalid format: {gps_stats['invalid_format']} ({format_percent(gps_stats['invalid_format'], len(df))})"

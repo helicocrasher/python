@@ -141,6 +141,13 @@ def compute_capacity_mah(currents_a, timestamps):
     return ah * 1000.0
 
 
+def find_first_existing_column(df, candidates):
+    for name in candidates:
+        if name in df.columns:
+            return name
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze a GPS logfile CSV and print ride statistics.")
     parser.add_argument("file_name", help="Path to input CSV file")
@@ -153,7 +160,7 @@ def main():
 
     df = pd.read_csv(input_path)
 
-    required_columns = ["Time", "GSpd(kmh)", "Alt(m)", "Sats", "EscA(A)", "GPS"]
+    required_columns = ["Time", "GSpd(kmh)", "Alt(m)", "GPS"]
     missing = [c for c in required_columns if c not in df.columns]
     if missing:
         print("Error: missing required columns: " + ", ".join(missing))
@@ -185,17 +192,29 @@ def main():
     alt_rel = alt - alt.iloc[0] if not alt.dropna().empty else alt
 
     speed = pd.to_numeric(window["GSpd(kmh)"], errors="coerce")
-    sats = pd.to_numeric(window["Sats"], errors="coerce")
-    current = pd.to_numeric(window["EscA(A)"], errors="coerce")
+    air_speed = pd.to_numeric(window["ASpd(kmh)"], errors="coerce").clip(lower=0) if "ASpd(kmh)" in window.columns else None
+    sats = pd.to_numeric(window["Sats"], errors="coerce") if "Sats" in window.columns else None
+    batt_col = find_first_existing_column(window, ["Batt(V)", "EscV(V)", "A2(V)"])
+    batt_voltage = pd.to_numeric(window[batt_col], errors="coerce") if batt_col is not None else None
+    rx_col = find_first_existing_column(window, ["RxV(V)", "RxBt(V)"])
+    rx_voltage = pd.to_numeric(window[rx_col], errors="coerce") if rx_col is not None else None
+    tqly_col = find_first_existing_column(window, ["TQly", "TQly(%)"])
+    tqly = pd.to_numeric(window[tqly_col], errors="coerce") if tqly_col is not None else None
+    current_col = find_first_existing_column(window, ["EscA(A)", "ESCA(A)", "Curr(A)"])
+    current = pd.to_numeric(window[current_col], errors="coerce") if current_col is not None else None
 
-    rolling_current = (
-        pd.DataFrame({"t": window["_timestamp"], "i": current})
-        .set_index("t")["i"]
-        .rolling("3s", min_periods=1)
-        .mean()
-    )
-    max_avg_current_3s = rolling_current.max() if not rolling_current.empty else np.nan
-    capacity_mah = compute_capacity_mah(current, window["_timestamp"])
+    if current is not None:
+        rolling_current = (
+            pd.DataFrame({"t": window["_timestamp"], "i": current})
+            .set_index("t")["i"]
+            .rolling("3s", min_periods=1)
+            .mean()
+        )
+        max_avg_current_3s = rolling_current.max() if not rolling_current.empty else np.nan
+        capacity_mah = compute_capacity_mah(current, window["_timestamp"])
+    else:
+        max_avg_current_3s = np.nan
+        capacity_mah = np.nan
 
     lat = pd.to_numeric(window["_lat"], errors="coerce")
     lon = pd.to_numeric(window["_lon"], errors="coerce")
@@ -249,14 +268,51 @@ def main():
     print(f"  {format_min_avg_max(speed, 'km/h')}")
     print()
     print("Sats")
-    print(f"  {format_min_avg_max(sats)}")
+    if sats is None:
+        print("  n/a (column not present)")
+    else:
+        print(f"  {format_min_avg_max(sats)}")
+    print()
+    print("ASpd(kmh) (negative values clipped to 0)")
+    if air_speed is None:
+        print("  n/a (column not present)")
+    else:
+        print(f"  {format_min_avg_max(air_speed, 'km/h')}")
+    print()
+    print("RxV(V)")
+    if rx_voltage is None:
+        print("  n/a (column not present)")
+    else:
+        print(f"  Source column: {rx_col}")
+        print(f"  {format_min_avg_max(rx_voltage, 'V')}")
+    print()
+    print("Batt(V) / EscV(V) / A2(V)")
+    if batt_voltage is None:
+        print("  n/a (column not present)")
+    else:
+        print(f"  Source column: {batt_col}")
+        print(f"  {format_min_avg_max(batt_voltage, 'V')}")
+    print()
+    print("TQly")
+    if tqly is None:
+        print("  n/a (column not present)")
+    else:
+        print(f"  Source column: {tqly_col}")
+        print(f"  {format_min_avg_max(tqly)}")
     print()
     print("EscA(A)")
+    if current_col is None:
+        print("  Current sensor: n/a (EscA(A), ESCA(A), Curr(A) not present)")
+    else:
+        print(f"  Current sensor column: {current_col}")
     if pd.isna(max_avg_current_3s):
         print("  Max 3s average current: n/a")
     else:
         print(f"  Max 3s average current: {max_avg_current_3s:.2f} A")
-    print(f"  Capacity used: {capacity_mah:.2f} mAh")
+    if pd.isna(capacity_mah):
+        print("  Capacity used: n/a")
+    else:
+        print(f"  Capacity used: {capacity_mah:.2f} mAh")
     print()
     print("GPS")
     print(f"  Total distance travelled: {total_distance_m / 1000.0:.3f} km")
